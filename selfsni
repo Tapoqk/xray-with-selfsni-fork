@@ -9,7 +9,7 @@ apt install curl wget nginx qrencode jq -y
 wget -O -  https://get.acme.sh | sh
 ~/.acme.sh/acme.sh --upgrade --auto-upgrade
 ~/.acme.sh/acme.sh --issue --server letsencrypt -d $domain -w /var/www/html --keylength ec-256 --force
-~/.acme.sh/acme.sh --installcert -d $domain --cert-file ~/.acme.sh/acme.sh/$domain_ecc/$domain.cer --key-file ~/.acme.sh/acme.sh/$domain_ecc/$domain.key --fullchain-file ~/.acme.sh/acme.sh/$domain_ecc/fullchain.cer --ecc
+~/.acme.sh/acme.sh --installcert -d $domain --cert-file ~/.acme.sh/acme.sh/${domain}_ecc/$domain.cer --key-file ~/.acme.sh/acme.sh/${domain}_ecc/$domain.key --fullchain-file ~/.acme.sh/acme.sh/${domain}_ecc/fullchain.cer --ecc
 
 # Копируем сертификаты в другую папку для Xray
 mkdir -p /usr/local/etc/xray/xray_cert/
@@ -51,7 +51,6 @@ fi
 bash -c "$(curl -4 -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
 [ -f /usr/local/etc/xray/.keys ] && rm /usr/local/etc/xray/.keys
 touch /usr/local/etc/xray/.keys
-echo "shortsid: $(openssl rand -hex 8)" >> /usr/local/etc/xray/.keys
 echo "uuid: $(xray uuid)" >> /usr/local/etc/xray/.keys
 echo "domain: $domain" >> /usr/local/etc/xray/.keys
 
@@ -61,6 +60,23 @@ export uuid=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/uuid/ {print $2}')
 touch /usr/local/etc/xray/config.json
 cat << EOF > /usr/local/etc/xray/config.json
 {
+    "stats": {},
+    "api": {
+        "tag": "api",
+        "services": ["StatsService"]
+    },
+    "policy": {
+        "levels": {
+            "0": {
+                "statsUserUplink": true,
+                "statsUserDownlink": true
+            }
+        },
+        "system": {
+            "statsInboundUplink": true,
+            "statsInboundDownlink": true
+        }
+    },
     "dns": {
       "servers": [
         "https+local://1.1.1.1/dns-query",
@@ -72,6 +88,11 @@ cat << EOF > /usr/local/etc/xray/config.json
         "rules": [
             {
                 "type": "field",
+                "inboundTag": ["api"],
+                "outboundTag": "api"
+            },
+            {
+                "type": "field",
                 "domain": [
                     "geosite:category-ads-all"
                 ],
@@ -80,6 +101,15 @@ cat << EOF > /usr/local/etc/xray/config.json
         ]
     },
     "inbounds": [
+        {
+            "listen": "127.0.0.1",
+            "port": 10085,
+            "protocol": "dokodemo-door",
+            "settings": {
+                "address": "127.0.0.1"
+            },
+            "tag": "api"
+        },
         {
             "port": 443,
             "protocol": "vless",
@@ -132,16 +162,32 @@ EOF
 touch /usr/local/bin/userlist
 cat << 'EOF' > /usr/local/bin/userlist
 #!/bin/bash
-emails=($(jq -r '.inbounds[0].settings.clients[].email' "/usr/local/etc/xray/config.json"))
+emails=($(jq -r '.inbounds[1].settings.clients[].email' "/usr/local/etc/xray/config.json"))
 
 if [[ ${#emails[@]} -eq 0 ]]; then
     echo "Список клиентов пуст"
     exit 1
 fi
 
+# Два замера трафика с паузой — если вырос, юзер онлайн
+stats1=$(xray api statsquery --server=127.0.0.1:10085 --pattern "user" 2>/dev/null)
+sleep 2
+stats2=$(xray api statsquery --server=127.0.0.1:10085 --pattern "user" 2>/dev/null)
+
 echo "Список клиентов:"
 for i in "${!emails[@]}"; do
-    echo "$((i+1)). ${emails[$i]}"
+    email="${emails[$i]}"
+
+    t1=$(echo "$stats1" | jq -r --arg email "$email" '.stat[] | select(.name | contains($email)) | .value // "0"' 2>/dev/null | awk '{s+=$1} END {print s+0}')
+    t2=$(echo "$stats2" | jq -r --arg email "$email" '.stat[] | select(.name | contains($email)) | .value // "0"' 2>/dev/null | awk '{s+=$1} END {print s+0}')
+
+    if (( t2 > t1 )); then
+        status="🟢"
+    else
+        status="🔴"
+    fi
+
+    echo "$((i+1)). ${email}  ${status}"
 done
 EOF
 chmod +x /usr/local/bin/userlist
@@ -150,11 +196,11 @@ chmod +x /usr/local/bin/userlist
 touch /usr/local/bin/mainuser
 cat << 'EOF' > /usr/local/bin/mainuser
 #!/bin/bash
-protocol=$(jq -r '.inbounds[0].protocol' /usr/local/etc/xray/config.json)
-port=$(jq -r '.inbounds[0].port' /usr/local/etc/xray/config.json)
+protocol=$(jq -r '.inbounds[1].protocol' /usr/local/etc/xray/config.json)
+port=$(jq -r '.inbounds[1].port' /usr/local/etc/xray/config.json)
 uuid=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/uuid/ {print $2}')
 domain=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/domain/ {print $2}')
-fp=$(jq -r '.inbounds[0].streamSettings.tlsSettings.fingerprint' /usr/local/etc/xray/config.json)
+fp=$(jq -r '.inbounds[1].streamSettings.tlsSettings.fingerprint' /usr/local/etc/xray/config.json)
 link="$protocol://$uuid@$domain:$port?security=tls&alpn=http%2F1.1&fp=$fp&spx=/&type=tcp&flow=xtls-rprx-vision&headerType=none&encryption=none#mainuser"
 echo ""
 echo "Ссылка для подключения":
@@ -166,7 +212,6 @@ EOF
 chmod +x /usr/local/bin/mainuser
 
 # Исполняемый файл для создания новых клиентов
-# Добавить сюда "level": 0,
 touch /usr/local/bin/newuser
 cat << 'EOF' > /usr/local/bin/newuser
 #!/bin/bash
@@ -176,19 +221,19 @@ read -p "Введите имя пользователя (email): " email
     echo "Имя пользователя не может быть пустым или содержать пробелы. Попробуйте снова."
     exit 1
     fi
-user_json=$(jq --arg email "$email" '.inbounds[0].settings.clients[] | select(.email == $email)' /usr/local/etc/xray/config.json)
+user_json=$(jq --arg email "$email" '.inbounds[1].settings.clients[] | select(.email == $email)' /usr/local/etc/xray/config.json)
 
 if [[ -z "$user_json" ]]; then
 uuid=$(xray uuid)
-jq --arg email "$email" --arg uuid "$uuid" '.inbounds[0].settings.clients += [{"email": $email, "id": $uuid, "flow": "xtls-rprx-vision"}]' /usr/local/etc/xray/config.json > tmp.json && mv tmp.json /usr/local/etc/xray/config.json
+jq --arg email "$email" --arg uuid "$uuid" '.inbounds[1].settings.clients += [{"email": $email, "id": $uuid, "flow": "xtls-rprx-vision"}]' /usr/local/etc/xray/config.json > tmp.json && mv tmp.json /usr/local/etc/xray/config.json
 systemctl restart xray
-index=$(jq --arg email "$email" '.inbounds[0].settings.clients | to_entries[] | select(.value.email == $email) | .key'  /usr/local/etc/xray/config.json)
-protocol=$(jq -r '.inbounds[0].protocol' /usr/local/etc/xray/config.json)
-port=$(jq -r '.inbounds[0].port' /usr/local/etc/xray/config.json)
-uuid=$(jq --argjson index "$index" -r '.inbounds[0].settings.clients[$index].id' /usr/local/etc/xray/config.json)
-username=$(jq --argjson index "$index" -r '.inbounds[0].settings.clients[$index].email' /usr/local/etc/xray/config.json)
+index=$(jq --arg email "$email" '.inbounds[1].settings.clients | to_entries[] | select(.value.email == $email) | .key'  /usr/local/etc/xray/config.json)
+protocol=$(jq -r '.inbounds[1].protocol' /usr/local/etc/xray/config.json)
+port=$(jq -r '.inbounds[1].port' /usr/local/etc/xray/config.json)
+uuid=$(jq --argjson index "$index" -r '.inbounds[1].settings.clients[$index].id' /usr/local/etc/xray/config.json)
+username=$(jq --argjson index "$index" -r '.inbounds[1].settings.clients[$index].email' /usr/local/etc/xray/config.json)
 domain=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/domain/ {print $2}')
-fp=$(jq -r '.inbounds[0].streamSettings.tlsSettings.fingerprint' /usr/local/etc/xray/config.json)
+fp=$(jq -r '.inbounds[1].streamSettings.tlsSettings.fingerprint' /usr/local/etc/xray/config.json)
 link="$protocol://$uuid@$domain:$port?security=tls&alpn=http%2F1.1&fp=$fp&spx=/&type=tcp&flow=xtls-rprx-vision&headerType=none&encryption=none#$username"
 echo ""
 echo "Ссылка для подключения":
@@ -206,7 +251,7 @@ chmod +x /usr/local/bin/newuser
 touch /usr/local/bin/rmuser
 cat << 'EOF' > /usr/local/bin/rmuser
 #!/bin/bash
-emails=($(jq -r '.inbounds[0].settings.clients[].email' "/usr/local/etc/xray/config.json"))
+emails=($(jq -r '.inbounds[1].settings.clients[].email' "/usr/local/etc/xray/config.json"))
 
 if [[ ${#emails[@]} -eq 0 ]]; then
     echo "Нет клиентов для удаления."
@@ -228,7 +273,7 @@ fi
 selected_email="${emails[$((choice - 1))]}"
 
 jq --arg email "$selected_email" \
-   '(.inbounds[0].settings.clients) |= map(select(.email != $email))' \
+   '(.inbounds[1].settings.clients) |= map(select(.email != $email))' \
    "/usr/local/etc/xray/config.json" > tmp && mv tmp "/usr/local/etc/xray/config.json"
 
 systemctl restart xray
@@ -241,7 +286,7 @@ chmod +x /usr/local/bin/rmuser
 touch /usr/local/bin/sharelink
 cat << 'EOF' > /usr/local/bin/sharelink
 #!/bin/bash
-emails=($(jq -r '.inbounds[0].settings.clients[].email' /usr/local/etc/xray/config.json))
+emails=($(jq -r '.inbounds[1].settings.clients[].email' /usr/local/etc/xray/config.json))
 
 for i in "${!emails[@]}"; do
    echo "$((i + 1)). ${emails[$i]}"
@@ -257,14 +302,14 @@ fi
 selected_email="${emails[$((client - 1))]}"
 
 
-index=$(jq --arg email "$selected_email" '.inbounds[0].settings.clients | to_entries[] | select(.value.email == $email) | .key'  /usr/local/etc/xray/config.json)
-protocol=$(jq -r '.inbounds[0].protocol' /usr/local/etc/xray/config.json)
-port=$(jq -r '.inbounds[0].port' /usr/local/etc/xray/config.json) 
-uuid=$(jq --argjson index "$index" -r '.inbounds[0].settings.clients[$index].id' /usr/local/etc/xray/config.json)
-username=$(jq --argjson index "$index" -r '.inbounds[0].settings.clients[$index].email' /usr/local/etc/xray/config.json)
+index=$(jq --arg email "$selected_email" '.inbounds[1].settings.clients | to_entries[] | select(.value.email == $email) | .key'  /usr/local/etc/xray/config.json)
+protocol=$(jq -r '.inbounds[1].protocol' /usr/local/etc/xray/config.json)
+port=$(jq -r '.inbounds[1].port' /usr/local/etc/xray/config.json) 
+uuid=$(jq --argjson index "$index" -r '.inbounds[1].settings.clients[$index].id' /usr/local/etc/xray/config.json)
+username=$(jq --argjson index "$index" -r '.inbounds[1].settings.clients[$index].email' /usr/local/etc/xray/config.json)
 sni=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/domain/ {print $2}')
 domain=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/domain/ {print $2}')
-fp=$(jq -r '.inbounds[0].streamSettings.tlsSettings.fingerprint' /usr/local/etc/xray/config.json)
+fp=$(jq -r '.inbounds[1].streamSettings.tlsSettings.fingerprint' /usr/local/etc/xray/config.json)
 link="$protocol://$uuid@$domain:$port?security=tls&alpn=http%2F1.1&fp=$fp&spx=/&type=tcp&flow=xtls-rprx-vision&headerType=none&encryption=none#$username"
 echo ""
 echo "Ссылка для подключения":
@@ -312,6 +357,12 @@ cat << 'EOF' > $HOME/help
 EOF
 
 
+# Создаем заглушку сайта
+mkdir -p /var/www/html
+tee /var/www/html/index.html >/dev/null <<'HTML'
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>Please wait</title><style>body{background:#080808;height:100vh;margin:0;display:flex;flex-direction:column;align-items:center;justify-content:center;font-family:sans-serif}.dots{display:flex;gap:15px;margin-bottom:30px}.d{width:20px;height:20px;background:#fff;border-radius:50%;animation:b 1.4s infinite ease-in-out both}.d:nth-child(1){animation-delay:-0.32s}.d:nth-child(2){animation-delay:-0.16s}@keyframes b{0%,80%,100%{transform:scale(0);opacity:0.2}40%{transform:scale(1);opacity:1}}.t{color:#555;font-size:14px;letter-spacing:2px;font-weight:600}</style></head><body><div class="dots"><div class="d"></div><div class="d"></div><div class="d"></div></div><div class="t">RETRYING CONNECTION</div></body></html>
+HTML
+
 # Заменяем стандартный файл конфигурации nginx
 cat << EOF > /etc/nginx/sites-available/default
 server {
@@ -331,5 +382,4 @@ server {
         add_header Strict-Transport-Security "max-age=63072000" always;
 }
 EOF
-mv /var/www/html/index.nginx-debian.html /var/www/html/index.html
 systemctl restart nginx
