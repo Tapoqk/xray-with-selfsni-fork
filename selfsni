@@ -49,6 +49,7 @@ fi
 
 # Устанавливаем ядро Xray
 bash -c "$(curl -4 -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+mkdir -p /var/log/xray
 [ -f /usr/local/etc/xray/.keys ] && rm /usr/local/etc/xray/.keys
 touch /usr/local/etc/xray/.keys
 echo "uuid: $(xray uuid)" >> /usr/local/etc/xray/.keys
@@ -60,6 +61,10 @@ export uuid=$(cat /usr/local/etc/xray/.keys | awk -F': ' '/uuid/ {print $2}')
 touch /usr/local/etc/xray/config.json
 cat << EOF > /usr/local/etc/xray/config.json
 {
+    "log": {
+        "access": "/var/log/xray/access.log",
+        "loglevel": "warning"
+    },
     "stats": {},
     "api": {
         "tag": "api",
@@ -169,22 +174,26 @@ if [[ ${#emails[@]} -eq 0 ]]; then
     exit 1
 fi
 
-# Два замера трафика с паузой — если вырос, юзер онлайн
-stats1=$(xray api statsquery --server=127.0.0.1:10085 --pattern "user" 2>/dev/null)
-sleep 2
-stats2=$(xray api statsquery --server=127.0.0.1:10085 --pattern "user" 2>/dev/null)
+# Считаем онлайном тех, у кого есть запись в логе за последние 3 минуты
+LOGFILE="/var/log/xray/access.log"
+THRESHOLD=$(date -d "30 seconds ago" +%s)
 
 echo "Список клиентов:"
 for i in "${!emails[@]}"; do
     email="${emails[$i]}"
+    status="🔴"
 
-    t1=$(echo "$stats1" | jq -r --arg email "$email" '.stat[] | select(.name | contains($email)) | .value // "0"' 2>/dev/null | awk '{s+=$1} END {print s+0}')
-    t2=$(echo "$stats2" | jq -r --arg email "$email" '.stat[] | select(.name | contains($email)) | .value // "0"' 2>/dev/null | awk '{s+=$1} END {print s+0}')
-
-    if (( t2 > t1 )); then
-        status="🟢"
-    else
-        status="🔴"
+    if [[ -f "$LOGFILE" ]]; then
+        while IFS= read -r line; do
+            log_time=$(echo "$line" | grep -oP '^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}')
+            if [[ -n "$log_time" ]]; then
+                log_ts=$(date -d "$log_time" +%s 2>/dev/null)
+                if [[ -n "$log_ts" && "$log_ts" -ge "$THRESHOLD" ]]; then
+                    status="🟢"
+                    break
+                fi
+            fi
+        done < <(grep "email: $email" "$LOGFILE" 2>/dev/null)
     fi
 
     echo "$((i+1)). ${email}  ${status}"
